@@ -20,6 +20,7 @@ const __constant__  uint32_t __align__(8) c_H256[8] = {
 __constant__ static uint32_t __align__(8) c_K[64];
 __constant__ static uint32_t __align__(8) c_target[2];
 __device__ uint64_t d_target[1];
+__device__ uint32_t d_totalFound[1];  // Total number of nonces found
 
 static uint32_t* d_resNonces[MAX_GPUS] = { 0 };
 
@@ -419,10 +420,12 @@ void sha256d_gpu_hash_shared(const uint32_t threads, const uint32_t startNonce, 
 
 		// valid nonces
 		uint64_t high = cuda_swab32ll(((uint64_t*)buf)[3]);
-		if (high <= c_target[0]) {
-			//printf("%08x %08x - %016llx %016llx - %08x %08x\n", buf[7], buf[6], high, d_target[0], c_target[1], c_target[0]);
-			resNonces[1] = atomicExch(resNonces, nonce);
-			//d_target[0] = high;
+		
+		if (high <= d_target[0]) {
+			uint32_t count = atomicAdd(&d_totalFound[0], 1);
+			if (count < 2) {
+				resNonces[count] = nonce;
+			}
 		}
 	}
 }
@@ -451,6 +454,10 @@ void sha256d_setBlock_80(uint32_t *pdata, uint32_t *ptarget)
 	for (int i=0;i<4;i++) end[i] = cuda_swab32(pdata[16+i]);
 	sha256_round_body_host(in, buf, cpu_K);
 
+	// Debug: Print midstate
+	printf("CUDA Midstate: ");
+	for (int i=0; i<8; i++) printf("0x%08x%s", buf[i], (i<7)?", ":"\n");
+
 	CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_midstate76, buf, 32, 0, cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_dataEnd80,  end, sizeof(end), 0, cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_target, &ptarget[6], 8, 0, cudaMemcpyHostToDevice));
@@ -465,12 +472,21 @@ void sha256d_hash_80(int thr_id, uint32_t threads, uint32_t startNonce, uint32_t
 	dim3 grid(threads/threadsperblock);
 	dim3 block(threadsperblock);
 
+	// Reset counter
+	uint32_t zero = 0;
+	CUDA_SAFE_CALL(cudaMemcpyToSymbol(d_totalFound, &zero, sizeof(uint32_t), 0, cudaMemcpyHostToDevice));
+	
+	// Clear resNonces array (now only using indices 0 and 1, no longer using swap method)
 	CUDA_SAFE_CALL(cudaMemset(d_resNonces[thr_id], 0xFF, 2 * sizeof(uint32_t)));
 	cudaThreadSynchronize();
 	sha256d_gpu_hash_shared <<<grid, block>>> (threads, startNonce, d_resNonces[thr_id]);
 	cudaThreadSynchronize();
 
 	CUDA_SAFE_CALL(cudaMemcpy(resNonces, d_resNonces[thr_id], 2 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+	
+	// Read total count to resNonces[2]
+	CUDA_SAFE_CALL(cudaMemcpyFromSymbol(&resNonces[2], d_totalFound, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost));
+	
 	if (resNonces[0] == resNonces[1]) {
 		resNonces[1] = UINT32_MAX;
 	}
